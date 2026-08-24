@@ -1,11 +1,12 @@
-import os
-import time
+from datetime import datetime, timedelta
+import calendar
 import threading
-from datetime import datetime
+import time
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from curl_cffi import requests
+
+from tefasmak import fon_5y_fiyat
 
 
 app = FastAPI(title="TEFAS API")
@@ -20,157 +21,130 @@ app.add_middleware(
 )
 
 
-TEFAS_URL = (
-    "https://www.tefas.gov.tr/api/funds/"
-    "fonFiyatBilgiGetir"
-)
+# ==========================================================
+# CACHE
+# ==========================================================
 
 CACHE_SECONDS = 21600  # 6 saat
 
 cache = {}
-
 cache_lock = threading.Lock()
 
 
-def parse_price(value):
-    if value is None:
-        return None
+# ==========================================================
+# TARİH YARDIMCILARI
+# ==========================================================
 
-    text = str(value).strip()
+def add_months(date, months):
 
-    if "," in text and "." in text:
-        text = text.replace(".", "").replace(",", ".")
-    elif "," in text:
-        text = text.replace(",", ".")
+    year = date.year
+    month = date.month + months
 
-    return float(text)
+    year += (month - 1) // 12
+    month = ((month - 1) % 12) + 1
 
+    day = min(
+        date.day,
+        calendar.monthrange(year, month)[1]
+    )
 
-def parse_date(value):
-    text = str(value)[:10]
-
-    return datetime.strptime(
-        text,
-        "%Y-%m-%d"
+    return datetime(
+        year,
+        month,
+        day
     )
 
 
-def get_tefas_data(fund_code):
+def parse_date(value):
 
-    fund_code = fund_code.upper().strip()
+    if isinstance(value, datetime):
+        return value
 
-    now = time.time()
+    text = str(value).strip()
+
+    # 2026-08-24
+    if len(text) >= 10:
+        try:
+            return datetime.strptime(
+                text[:10],
+                "%Y-%m-%d"
+            )
+        except Exception:
+            pass
+
+    # 24.08.2026
+    try:
+        return datetime.strptime(
+            text,
+            "%d.%m.%Y"
+        )
+    except Exception:
+        pass
+
+    raise ValueError(
+        f"Tarih çözümlenemedi: {value}"
+    )
+
+
+# ==========================================================
+# TEFAS VERİSİ
+# ==========================================================
+
+def load_fund(fund_code):
+
+    fund_code = (
+        str(fund_code)
+        .strip()
+        .upper()
+    )
 
     # ------------------------------------------------------
     # CACHE
     # ------------------------------------------------------
+
+    now = time.time()
 
     with cache_lock:
 
         cached = cache.get(fund_code)
 
         if cached:
+
             cached_time, cached_data = cached
 
             if now - cached_time < CACHE_SECONDS:
+
                 return cached_data
 
 
     # ------------------------------------------------------
-    # TEFAS İSTEĞİ
+    # TEFAS
     # ------------------------------------------------------
-
-    headers = {
-
-        "Accept": "application/json, text/plain, */*",
-
-        "Content-Type": "application/json",
-
-        "Origin":
-            "https://www.tefas.gov.tr",
-
-        "Referer":
-            "https://www.tefas.gov.tr/tr/fon-verileri",
-
-        "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/146.0.0.0 Safari/537.36"
-
-    }
-
-
-    payload = {
-
-        "fonKodu": fund_code,
-
-        "dil": "TR",
-
-        "periyod": 60
-
-    }
-
 
     try:
 
-        response = requests.post(
-            TEFAS_URL,
-            headers=headers,
-            json=payload,
-            impersonate="chrome",
-            timeout=30
+        rows = fon_5y_fiyat(
+            fund_code
         )
 
     except Exception as exc:
 
         raise HTTPException(
             status_code=502,
-            detail=f"TEFAS bağlantı hatası: {exc}"
-        )
-
-
-    if response.status_code != 200:
-
-        raise HTTPException(
-            status_code=502,
             detail=(
-                f"TEFAS HTTP {response.status_code}: "
-                f"{response.text[:300]}"
+                "TEFAS verisi alınamadı: "
+                + str(exc)
             )
         )
 
 
-    try:
-
-        result = response.json()
-
-    except Exception:
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "TEFAS geçerli JSON döndürmedi: "
-                + response.text[:300]
-            )
-        )
-
-
-    if result.get("errorMessage"):
-
-        raise HTTPException(
-            status_code=502,
-            detail=result["errorMessage"]
-        )
-
-
-    rows = result.get("resultList")
-
-
-    if not rows or not isinstance(rows, list):
+    if not rows:
 
         raise HTTPException(
             status_code=404,
-            detail=f"{fund_code} için veri bulunamadı."
+            detail=(
+                f"{fund_code} için TEFAS verisi bulunamadı."
+            )
         )
 
 
@@ -185,9 +159,48 @@ def get_tefas_data(fund_code):
 
         try:
 
-            date = parse_date(row["tarih"])
+            raw_date = (
+                row.get("tarih")
+                if isinstance(row, dict)
+                else None
+            )
 
-            price = parse_price(row["fiyat"])
+            raw_price = (
+                row.get("fiyat")
+                if isinstance(row, dict)
+                else None
+            )
+
+            if raw_date is None:
+                continue
+
+            if raw_price is None:
+                continue
+
+
+            date = parse_date(
+                raw_date
+            )
+
+
+            if isinstance(raw_price, str):
+
+                price_text = (
+                    raw_price
+                    .strip()
+                    .replace(",", ".")
+                )
+
+                price = float(
+                    price_text
+                )
+
+            else:
+
+                price = float(
+                    raw_price
+                )
+
 
             data.append(
                 {
@@ -195,6 +208,7 @@ def get_tefas_data(fund_code):
                     "price": price
                 }
             )
+
 
         except Exception:
 
@@ -205,9 +219,15 @@ def get_tefas_data(fund_code):
 
         raise HTTPException(
             status_code=404,
-            detail=f"{fund_code} için geçerli fiyat verisi yok."
+            detail=(
+                f"{fund_code} için geçerli fiyat verisi bulunamadı."
+            )
         )
 
+
+    # ------------------------------------------------------
+    # TARİHE GÖRE SIRALA
+    # ------------------------------------------------------
 
     data.sort(
         key=lambda x: x["date"]
@@ -218,7 +238,7 @@ def get_tefas_data(fund_code):
 
 
     # ------------------------------------------------------
-    # YARDIMCI FONKSİYONLAR
+    # HEDEF TARİHTEN ÖNCEKİ FİYAT
     # ------------------------------------------------------
 
     def find_before(target):
@@ -226,15 +246,26 @@ def get_tefas_data(fund_code):
         for item in reversed(data):
 
             if item["date"] <= target:
+
                 return item["price"]
+
 
         return data[0]["price"]
 
 
-    def return_percent(old_price):
+    # ------------------------------------------------------
+    # GETİRİ
+    # ------------------------------------------------------
 
-        if not old_price:
+    def calc(old_price):
+
+        if (
+            old_price is None
+            or old_price == 0
+        ):
+
             return None
+
 
         return (
             (latest["price"] - old_price)
@@ -243,38 +274,20 @@ def get_tefas_data(fund_code):
         )
 
 
-    def add_months(date, months):
-
-        year = date.year
-        month = date.month + months
-
-        year += (month - 1) // 12
-        month = ((month - 1) % 12) + 1
-
-        import calendar
-
-        day = min(
-            date.day,
-            calendar.monthrange(year, month)[1]
-        )
-
-        return datetime(
-            year,
-            month,
-            day
-        )
-
-
     # ------------------------------------------------------
     # DÖNEMLER
     # ------------------------------------------------------
 
-    from datetime import timedelta
+    one_day = (
+        latest["date"]
+        - timedelta(days=1)
+    )
 
 
-    one_day = latest["date"] - timedelta(days=1)
-
-    one_week = latest["date"] - timedelta(days=7)
+    one_week = (
+        latest["date"]
+        - timedelta(days=7)
+    )
 
 
     one_month = add_months(
@@ -283,13 +296,13 @@ def get_tefas_data(fund_code):
     )
 
 
-    three_month = add_months(
+    three_months = add_months(
         latest["date"],
         -3
     )
 
 
-    six_month = add_months(
+    six_months = add_months(
         latest["date"],
         -6
     )
@@ -301,13 +314,13 @@ def get_tefas_data(fund_code):
     )
 
 
-    three_year = add_months(
+    three_years = add_months(
         latest["date"],
         -36
     )
 
 
-    five_year = add_months(
+    five_years = add_months(
         latest["date"],
         -60
     )
@@ -322,7 +335,10 @@ def get_tefas_data(fund_code):
 
     for item in data:
 
-        if item["date"].year == latest["date"].year:
+        if (
+            item["date"].year
+            == latest["date"].year
+        ):
 
             year_start_price = item["price"]
 
@@ -347,50 +363,65 @@ def get_tefas_data(fund_code):
             ),
 
         "gunluk":
-            return_percent(
-                find_before(one_day)
+            calc(
+                find_before(
+                    one_day
+                )
             ),
 
         "haftalik":
-            return_percent(
-                find_before(one_week)
+            calc(
+                find_before(
+                    one_week
+                )
             ),
 
         "aylik":
-            return_percent(
-                find_before(one_month)
+            calc(
+                find_before(
+                    one_month
+                )
             ),
 
         "3aylik":
-            return_percent(
-                find_before(three_month)
+            calc(
+                find_before(
+                    three_months
+                )
             ),
 
         "6aylik":
-            return_percent(
-                find_before(six_month)
+            calc(
+                find_before(
+                    six_months
+                )
             ),
 
         "1yillik":
-            return_percent(
-                find_before(one_year)
+            calc(
+                find_before(
+                    one_year
+                )
             ),
 
         "3yillik":
-            return_percent(
-                find_before(three_year)
+            calc(
+                find_before(
+                    three_years
+                )
             ),
 
         "5yillik":
-            return_percent(
-                find_before(five_year)
+            calc(
+                find_before(
+                    five_years
+                )
             ),
 
         "yilbasi":
-            return_percent(
+            calc(
                 year_start_price
             )
-
     }
 
 
@@ -409,19 +440,17 @@ def get_tefas_data(fund_code):
     return result
 
 
+# ==========================================================
+# API ENDPOINTLERİ
+# ==========================================================
+
 @app.get("/")
 def root():
 
     return {
-
         "status": "OK",
-
-        "service":
-            "TEFAS API",
-
-        "usage":
-            "/fund/GSP"
-
+        "service": "TEFAS API",
+        "usage": "/fund/GSP"
     }
 
 
@@ -436,6 +465,6 @@ def health():
 @app.get("/fund/{fund_code}")
 def fund(fund_code: str):
 
-    return get_tefas_data(
+    return load_fund(
         fund_code
     )
