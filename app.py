@@ -1,7 +1,7 @@
-from datetime import datetime, timedelta
-import calendar
 import threading
 import time
+import calendar
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,19 +21,54 @@ app.add_middleware(
 )
 
 
-# ==========================================================
-# CACHE
-# ==========================================================
-
-CACHE_SECONDS = 21600  # 6 saat
-
+CACHE_SECONDS = 21600
 cache = {}
 cache_lock = threading.Lock()
 
 
-# ==========================================================
-# TARİH YARDIMCILARI
-# ==========================================================
+def parse_date(value):
+
+    text = str(value).strip()
+
+    formats = [
+        "%Y-%m-%d",
+        "%Y-%m-%dT%H:%M:%S",
+        "%d.%m.%Y",
+        "%d/%m/%Y",
+    ]
+
+    for fmt in formats:
+
+        try:
+            return datetime.strptime(text, fmt)
+
+        except ValueError:
+            pass
+
+    return datetime.fromisoformat(
+        text.replace("Z", "")
+    )
+
+
+def parse_price(value):
+
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+
+    if "," in text and "." in text:
+        text = text.replace(".", "")
+        text = text.replace(",", ".")
+
+    elif "," in text:
+        text = text.replace(",", ".")
+
+    return float(text)
+
 
 def add_months(date, months):
 
@@ -55,66 +90,50 @@ def add_months(date, months):
     )
 
 
-def parse_date(value):
+def find_before(data, target):
 
-    if isinstance(value, datetime):
-        return value
+    for item in reversed(data):
 
-    text = str(value).strip()
+        if item["date"] <= target:
+            return item["price"]
 
-    # 2026-08-24
-    if len(text) >= 10:
-        try:
-            return datetime.strptime(
-                text[:10],
-                "%Y-%m-%d"
-            )
-        except Exception:
-            pass
+    return data[0]["price"]
 
-    # 24.08.2026
-    try:
-        return datetime.strptime(
-            text,
-            "%d.%m.%Y"
-        )
-    except Exception:
-        pass
 
-    raise ValueError(
-        f"Tarih çözümlenemedi: {value}"
+def calc(latest_price, old_price):
+
+    if old_price in (None, 0):
+        return None
+
+    return (
+        (latest_price - old_price)
+        / old_price
+        * 100
     )
 
 
-# ==========================================================
-# TEFAS VERİSİ
-# ==========================================================
+def get_fund_data(fund_code):
 
-def load_fund(fund_code):
+    fund_code = str(
+        fund_code
+    ).strip().upper()
 
-    fund_code = (
-        str(fund_code)
-        .strip()
-        .upper()
-    )
 
     # ------------------------------------------------------
     # CACHE
     # ------------------------------------------------------
 
-    now = time.time()
-
     with cache_lock:
 
-        cached = cache.get(fund_code)
+        item = cache.get(fund_code)
 
-        if cached:
+        if item:
 
-            cached_time, cached_data = cached
+            saved_time, saved_data = item
 
-            if now - cached_time < CACHE_SECONDS:
+            if time.time() - saved_time < CACHE_SECONDS:
 
-                return cached_data
+                return saved_data
 
 
     # ------------------------------------------------------
@@ -143,64 +162,32 @@ def load_fund(fund_code):
         raise HTTPException(
             status_code=404,
             detail=(
-                f"{fund_code} için TEFAS verisi bulunamadı."
+                f"{fund_code} için veri bulunamadı."
             )
         )
 
 
     # ------------------------------------------------------
-    # VERİLERİ HAZIRLA
+    # NORMALİZE ET
     # ------------------------------------------------------
 
     data = []
-
 
     for row in rows:
 
         try:
 
-            raw_date = (
-                row.get("tarih")
-                if isinstance(row, dict)
-                else None
-            )
-
-            raw_price = (
-                row.get("fiyat")
-                if isinstance(row, dict)
-                else None
-            )
-
-            if raw_date is None:
-                continue
-
-            if raw_price is None:
-                continue
-
+            # tefasmak normalde
+            # {'tarih': ..., 'fiyat': ...}
+            # döndürüyor.
 
             date = parse_date(
-                raw_date
+                row["tarih"]
             )
 
-
-            if isinstance(raw_price, str):
-
-                price_text = (
-                    raw_price
-                    .strip()
-                    .replace(",", ".")
-                )
-
-                price = float(
-                    price_text
-                )
-
-            else:
-
-                price = float(
-                    raw_price
-                )
-
+            price = parse_price(
+                row["fiyat"]
+            )
 
             data.append(
                 {
@@ -208,7 +195,6 @@ def load_fund(fund_code):
                     "price": price
                 }
             )
-
 
         except Exception:
 
@@ -220,14 +206,11 @@ def load_fund(fund_code):
         raise HTTPException(
             status_code=404,
             detail=(
-                f"{fund_code} için geçerli fiyat verisi bulunamadı."
+                f"{fund_code} için "
+                "geçerli fiyat verisi yok."
             )
         )
 
-
-    # ------------------------------------------------------
-    # TARİHE GÖRE SIRALA
-    # ------------------------------------------------------
 
     data.sort(
         key=lambda x: x["date"]
@@ -236,92 +219,51 @@ def load_fund(fund_code):
 
     latest = data[-1]
 
-
-    # ------------------------------------------------------
-    # HEDEF TARİHTEN ÖNCEKİ FİYAT
-    # ------------------------------------------------------
-
-    def find_before(target):
-
-        for item in reversed(data):
-
-            if item["date"] <= target:
-
-                return item["price"]
-
-
-        return data[0]["price"]
+    latest_price = latest["price"]
+    latest_date = latest["date"]
 
 
     # ------------------------------------------------------
-    # GETİRİ
-    # ------------------------------------------------------
-
-    def calc(old_price):
-
-        if (
-            old_price is None
-            or old_price == 0
-        ):
-
-            return None
-
-
-        return (
-            (latest["price"] - old_price)
-            / old_price
-            * 100
-        )
-
-
-    # ------------------------------------------------------
-    # DÖNEMLER
+    # HEDEF TARİHLER
     # ------------------------------------------------------
 
     one_day = (
-        latest["date"]
+        latest_date
         - timedelta(days=1)
     )
 
-
     one_week = (
-        latest["date"]
+        latest_date
         - timedelta(days=7)
     )
 
-
     one_month = add_months(
-        latest["date"],
+        latest_date,
         -1
     )
 
-
     three_months = add_months(
-        latest["date"],
+        latest_date,
         -3
     )
 
-
     six_months = add_months(
-        latest["date"],
+        latest_date,
         -6
     )
 
-
     one_year = add_months(
-        latest["date"],
+        latest_date,
         -12
     )
 
-
     three_years = add_months(
-        latest["date"],
+        latest_date,
         -36
     )
 
-
     five_years = add_months(
-        latest["date"],
+        latest_date,
         -60
     )
 
@@ -332,13 +274,9 @@ def load_fund(fund_code):
 
     year_start_price = None
 
-
     for item in data:
 
-        if (
-            item["date"].year
-            == latest["date"].year
-        ):
+        if item["date"].year == latest_date.year:
 
             year_start_price = item["price"]
 
@@ -355,71 +293,88 @@ def load_fund(fund_code):
             fund_code,
 
         "fiyat":
-            latest["price"],
+            latest_price,
 
         "tarih":
-            latest["date"].strftime(
+            latest_date.strftime(
                 "%Y-%m-%d"
             ),
 
         "gunluk":
             calc(
+                latest_price,
                 find_before(
+                    data,
                     one_day
                 )
             ),
 
         "haftalik":
             calc(
+                latest_price,
                 find_before(
+                    data,
                     one_week
                 )
             ),
 
         "aylik":
             calc(
+                latest_price,
                 find_before(
+                    data,
                     one_month
                 )
             ),
 
         "3aylik":
             calc(
+                latest_price,
                 find_before(
+                    data,
                     three_months
                 )
             ),
 
         "6aylik":
             calc(
+                latest_price,
                 find_before(
+                    data,
                     six_months
                 )
             ),
 
         "1yillik":
             calc(
+                latest_price,
                 find_before(
+                    data,
                     one_year
                 )
             ),
 
         "3yillik":
             calc(
+                latest_price,
                 find_before(
+                    data,
                     three_years
                 )
             ),
 
         "5yillik":
             calc(
+                latest_price,
                 find_before(
+                    data,
                     five_years
                 )
             ),
 
         "yilbasi":
             calc(
+                latest_price,
                 year_start_price
             )
     }
@@ -441,7 +396,7 @@ def load_fund(fund_code):
 
 
 # ==========================================================
-# API ENDPOINTLERİ
+# ENDPOINTLER
 # ==========================================================
 
 @app.get("/")
@@ -465,6 +420,6 @@ def health():
 @app.get("/fund/{fund_code}")
 def fund(fund_code: str):
 
-    return load_fund(
+    return get_fund_data(
         fund_code
     )
